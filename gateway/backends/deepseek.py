@@ -43,6 +43,7 @@ from core.exceptions import (
 from gateway.backends import register
 from gateway.backends.base import BaseBackend
 from gateway.deepseek.client import _DeepSeekHTTPClient
+from gateway.schemas import Message, MessageList
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +56,7 @@ logger = logging.getLogger(__name__)
 class ChatRequest(BaseModel):
     """对话请求体。"""
 
-    messages: list[dict] = Field(
+    messages: list[Message] = Field(
         description="""OpenAI 格式的消息列表。
 
 每条消息包含 role 和 content 字段：
@@ -311,7 +312,7 @@ class DeepSeekBackend(BaseBackend):
 
     async def chat(
         self,
-        messages: list[dict],
+        messages: MessageList,
         model: str = "default",
         stream: bool = False,
     ) -> str | AsyncGenerator[str, None]:
@@ -399,7 +400,7 @@ class DeepSeekBackend(BaseBackend):
 
     async def _stream_response(
         self,
-        messages: list[dict],
+        messages: MessageList,
         model: str,
     ) -> AsyncGenerator[str, None]:
         """异步生成器接口——逐块 yield 内容给上游调用者。"""

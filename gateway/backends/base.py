@@ -19,6 +19,8 @@ from typing import AsyncGenerator
 
 from fastapi import APIRouter
 
+from gateway.schemas import MessageList
+
 
 class BaseBackend(ABC):
     """所有后端适配器必须实现的接口。"""
@@ -62,7 +64,7 @@ class BaseBackend(ABC):
     @abstractmethod
     async def chat(
         self,
-        messages: list[dict],
+        messages: MessageList,
         model: str = "default",
         stream: bool = False,
     ) -> str | AsyncGenerator[str, None]:

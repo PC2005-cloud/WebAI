@@ -26,12 +26,13 @@ from pydantic import BaseModel, Field
 
 from gateway.backends import register
 from gateway.backends.base import BaseBackend
+from gateway.schemas import Message, MessageList
 
 
 class ChatRequest(BaseModel):
     """对话请求体。"""
 
-    messages: list[dict] = Field(
+    messages: list[Message] = Field(
         description="OpenAI 格式的消息列表，如 [{\"role\": \"user\", \"content\": \"你好\"}]"
     )
     model: str = Field("default", description="模型 ID")
@@ -87,7 +88,7 @@ class DoubaoBackend(BaseBackend):
 
     async def chat(
         self,
-        messages: list[dict],
+        messages: MessageList,
         model: str = "default",
         stream: bool = False,
     ) -> str | AsyncGenerator[str, None]:

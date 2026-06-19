@@ -4,3 +4,5 @@ __pycache__/
 session/
 browsers/
 *.log
+.idea/
+优化计划

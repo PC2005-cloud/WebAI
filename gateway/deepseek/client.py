@@ -56,6 +56,7 @@ from core.exceptions import (
 from gateway.deepseek.pow import PowSolver
 from gateway.deepseek.session import load_token
 from gateway.deepseek.sse import extract_content_from_sse
+from gateway.schemas import MessageList
 
 logger = logging.getLogger(__name__)
 
@@ -83,23 +84,21 @@ _USER_AGENT = (
 # ============================================================
 
 
-def _build_prompt(messages: list[dict]) -> str:
-    """将 OpenAI 格式的 messages 列表拼接为纯文本提示词。
+def _build_prompt(messages: MessageList) -> str:
+    """将消息列表拼接为纯文本提示词。
 
     每个消息按角色添加标签，全部拼接后发给 DeepSeek 网页版 API。
-    标签名不重要（AI 网页版没有指令微调来识别特定标签），
-    重要的是内容和顺序的连贯性。
 
     Args:
-        messages: OpenAI 格式的消息列表
+        messages: 消息列表（Message 对象）
 
     Returns:
         拼接后的纯文本
     """
     parts = []
     for msg in messages:
-        role = msg["role"]
-        content = msg.get("content", "")
+        role = msg.role
+        content = msg.content
         if role == "system":
             parts.append(f"[系统指令]\n{content}")
         elif role == "user":
@@ -218,7 +217,7 @@ class _DeepSeekHTTPClient:
     # 核心 API
     # --------------------------------------------------
 
-    def ask(self, messages: list[dict], model: str = "default") -> str:
+    def ask(self, messages: MessageList, model: str = "default") -> str:
         """发送对话消息，返回完整响应文本。
 
         这是非流式接口——等待完整响应后一次性返回。
@@ -271,7 +270,7 @@ class _DeepSeekHTTPClient:
         return content
 
     def ask_stream(
-        self, messages: list[dict], model: str = "default"
+        self, messages: MessageList, model: str = "default"
     ) -> list[str]:
         """发送对话消息，返回内容块列表（流式模式用）。
 
