@@ -1,0 +1,22 @@
+[project]
+name = "webai-gateway"
+version = "0.1.0"
+description = "将多个 AI 网页版（DeepSeek、豆包等）封装成统一的 HTTP API"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+    "playwright>=1.48.0",
+    "httpx>=0.27.0",
+    "pydantic>=2.9.0",
+    "sse-starlette>=2.0.0",
+]
+
+[project.scripts]
+webai-gateway = "gateway.server:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24.0",
+]
