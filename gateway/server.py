@@ -46,6 +46,7 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+logging.getLogger("watchfiles.main").setLevel(logging.WARNING)
 
 # ============================================================
 # FastAPI 应用
@@ -167,7 +168,8 @@ def cmd_serve(args: argparse.Namespace) -> None:
         host=args.host,
         port=args.port,
         reload=args.reload,
-        log_config=None,  # 使用 setup_logging 的配置，不覆盖
+        reload_excludes=["**/__pycache__/**", "**/*.pyc", "**/*.log", "**/session/**"],
+        log_config=None,
     )
 
 

@@ -286,7 +286,7 @@ class DeepSeekBackend(BaseBackend):
             if self._client is not None:
                 return
             logger.info("[初始化] 启动 DeepSeek 客户端 ...")
-            client = _DeepSeekHTTPClient()
+            client = _DeepSeekHTTPClient(pow_executor=_pow_executor)
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(_pow_executor, client.start)
             self._client = client
@@ -314,7 +314,7 @@ class DeepSeekBackend(BaseBackend):
         _t0 = time.monotonic()
         session_id = await asyncio.to_thread(self._client._create_session)
         _t1 = time.monotonic()
-        pow_header = await loop.run_in_executor(_pow_executor, self._client._pow_solver.solve)
+        pow_header = self._client._get_pow()
         _t2 = time.monotonic()
         model_type = _model_type_from_user_model(req.model)
         logger.info("[流式] 会话%.1fs PoW%.1fs 总计%.1fs",

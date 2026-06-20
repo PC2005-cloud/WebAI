@@ -45,6 +45,7 @@ import logging
 import queue
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Optional
 from urllib.parse import urljoin
 
@@ -134,25 +135,23 @@ class _DeepSeekHTTPClient:
     线程安全: 所有公共方法应通过 asyncio.to_thread 调用。
     """
 
-    def __init__(self) -> None:
+    def __init__(self, pow_executor: Optional[ThreadPoolExecutor] = None) -> None:
         self._token: Optional[str] = None
         self._pow_solver: Optional[PowSolver] = None
+        self._http: Optional[httpx.Client] = None
         self._started = False
+        self._pow_queue: queue.Queue = queue.Queue(maxsize=3)
+        self._pow_stop = threading.Event()
+        self._pow_worker: Optional[threading.Thread] = None
+        # PoW 必须在固定线程执行，共享 executor 保证一致性
+        self._pow_executor = pow_executor or ThreadPoolExecutor(max_workers=1, thread_name_prefix="pow")
 
     # --------------------------------------------------
     # 生命周期
     # --------------------------------------------------
 
     def start(self) -> None:
-        """初始化客户端。
-
-        步骤:
-        1. 从 session 文件读取 token
-        2. 启动常驻的 PoW 计算浏览器
-
-        Raises:
-            SessionExpiredError: token 不存在或已过期
-        """
+        """初始化客户端。"""
         self._token = load_token()
         if not self._token:
             raise SessionExpiredError(
@@ -163,20 +162,48 @@ class _DeepSeekHTTPClient:
 
         self._pow_solver = PowSolver()
         self._pow_solver.start()
+
+        # 先算一个 PoW 放队列，同时启动后台线程持续算
+        first_pow = self._pow_solver.solve()
+        self._pow_queue.put(first_pow)
+        logger.info("[客户端] PoW 队列就绪")
+
+        self._pow_stop.clear()
+        self._pow_worker = threading.Thread(target=self._pow_worker_func, daemon=True)
+        self._pow_worker.start()
+
         self._started = True
         logger.info("[客户端] DeepSeek HTTP 客户端就绪")
 
     def close(self) -> None:
-        """释放所有资源。
-
-        主要包括关闭 PoW 浏览器。
-        幂等操作，可多次调用。
-        """
+        """释放所有资源。"""
+        self._pow_stop.set()
         if self._pow_solver:
             self._pow_solver.close()
             self._pow_solver = None
         self._started = False
         logger.info("[客户端] DeepSeek HTTP 客户端已关闭")
+
+    def _pow_worker_func(self) -> None:
+        """后台线程：持续解 PoW 放入队列，随取随补。"""
+        while not self._pow_stop.is_set():
+            try:
+                if self._pow_queue.qsize() < 2:
+                    future = self._pow_executor.submit(self._pow_solver.solve)
+                    new_pow = future.result(timeout=60)
+                    self._pow_queue.put(new_pow, timeout=5)
+                    logger.debug("[PoW] 队列补一个 (%d个)", self._pow_queue.qsize())
+                else:
+                    self._pow_stop.wait(0.5)
+            except Exception as exc:
+                logger.warning("[PoW] 后台计算失败: %s", exc)
+                self._pow_stop.wait(1)
+
+    def _get_pow(self) -> str:
+        """从队列取一个 PoW，队列空时等待。"""
+        pow_val = self._pow_queue.get(timeout=30)
+        logger.debug("[PoW] 取出一个，队列剩余 %d个", self._pow_queue.qsize())
+        return pow_val
 
     @property
     def is_healthy(self) -> bool:
@@ -231,7 +258,7 @@ class _DeepSeekHTTPClient:
         t0 = time.monotonic()
         sid = self._create_session()
         t1 = time.monotonic()
-        pow_header = self._pow_solver.solve()
+        pow_header = self._get_pow()
         t2 = time.monotonic()
         text_content, thinking = self._send_completion(
             sid, content, model_type, pow_header,
@@ -273,7 +300,7 @@ class _DeepSeekHTTPClient:
 
         t0 = time.monotonic()
         sid = self._create_session()
-        pow_header = self._pow_solver.solve()
+        pow_header = self._get_pow()
         chunks = self._stream_completion(
             sid, content, model_type, pow_header,
             thinking_enabled, search_enabled,
@@ -304,9 +331,7 @@ class _DeepSeekHTTPClient:
         logger.debug("[API] 创建 session ...")
 
         t0 = time.monotonic()
-        resp = httpx.post(
-            url,
-            json={},
+        resp = httpx.post(url, json={},
             headers={"Authorization": f"Bearer {self._token}"},
             timeout=_HTTP_TIMEOUT,
         )
@@ -332,19 +357,14 @@ class _DeepSeekHTTPClient:
             ) from exc
 
     def delete_session(self, session_id: str) -> None:
-        """删除指定 session，避免聊天记录堆积。
-
-        POST /api/v0/chat_session/delete
-        body: {"chat_session_id": "uuid"}
-        """
+        """删除指定 session，避免聊天记录堆积。"""
         try:
             url = urljoin(BASE_URL, "/api/v0/chat_session/delete")
-            resp = httpx.post(
-                url,
-                json={"chat_session_id": session_id},
-                headers={"Authorization": f"Bearer {self._token}"},
-                timeout=10,
-            )
+            if self._http:
+                resp = self._http.post(url, json={"chat_session_id": session_id})
+            else:
+                resp = httpx.post(url, json={"chat_session_id": session_id},
+                    headers={"Authorization": f"Bearer {self._token}"}, timeout=10)
             if resp.status_code == 200:
                 logger.debug("[API] session 已删除: %s", session_id[:8])
             else:
@@ -387,9 +407,7 @@ class _DeepSeekHTTPClient:
         t0 = time.monotonic()
         logger.debug("[API] 发送对话 (%d 字符) ...", len(prompt))
 
-        resp = httpx.post(
-            url, json=body, headers=headers, timeout=_HTTP_TIMEOUT,
-        )
+        resp = httpx.post(url, json=body, headers=headers, timeout=_HTTP_TIMEOUT)
         http_elapsed = time.monotonic() - t0
 
         if resp.status_code == 401:
@@ -548,7 +566,7 @@ class _DeepSeekHTTPClient:
 
             # 获取 PoW（如果未传入）
             if not pow_header:
-                pow_header = self._pow_solver.solve()
+                pow_header = self._pow_solver.solve()  # 备用：应优先使用 _get_pow()
 
             # 发起流式 HTTP 请求
             url = urljoin(BASE_URL, _COMPLETION_URL)
