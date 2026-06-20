@@ -22,6 +22,7 @@ import sys
 
 import uvicorn
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from core.exceptions import (
@@ -99,6 +100,15 @@ async def value_error_handler(request, exc: ValueError):
     """捕获参数校验错误，返回 400。"""
     logger.warning("[400] ValueError: %s", exc)
     return JSONResponse(status_code=400, content=Result.error(str(exc)).model_dump())
+
+
+# CORS — 允许前端测试页面跨域访问
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 # ============================================================

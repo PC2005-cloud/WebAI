@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WebAI Gateway 测试</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: system-ui, sans-serif; background: #f5f5f5; padding: 20px; display: grid; grid-template-columns: 1fr 1fr; gap: 20px; height: 100vh; }
+.card { background: #fff; border-radius: 12px; padding: 20px; box-shadow: 0 2px 8px rgba(0,0,0,.1); }
+.card h2 { font-size: 16px; margin-bottom: 12px; color: #333; }
+.card label { display: block; font-size: 13px; color: #666; margin: 8px 0 4px; }
+.card input, .card select { width: 100%; padding: 8px 12px; border: 1px solid #ddd; border-radius: 6px; font-size: 14px; }
+.card button { width: 100%; padding: 10px; border: none; border-radius: 6px; font-size: 14px; cursor: pointer; margin-top: 12px; }
+.btn-primary { background: #0066ff; color: #fff; }
+.btn-success { background: #00a854; color: #fff; }
+.btn-danger { background: #ff4d4f; color: #fff; }
+.btn-warning { background: #faad14; color: #fff; }
+pre { background: #f0f0f0; padding: 12px; border-radius: 6px; font-size: 12px; overflow: auto; max-height: 200px; margin-top: 8px; white-space: pre-wrap; }
+.thinking-block { background: #fffbe6; border-left: 3px solid #faad14; padding: 8px 12px; margin: 8px 0; border-radius: 4px; font-size: 13px; color: #666; }
+.response-area { grid-column: 1 / -1; }
+.row { display: flex; gap: 8px; }
+.row > * { flex: 1; }
+</style>
+</head>
+<body>
+
+<div class="card">
+  <h2>🔑 登录</h2>
+  <label>手机号</label>
+  <input id="mobile" value="13092297340">
+  <label>密码</label>
+  <input id="password" type="password" value="20050816Pc..">
+  <button class="btn-primary" onclick="login()">登录</button>
+  <button class="btn-danger" onclick="logout()" style="margin-top:8px">退出</button>
+  <pre id="loginResult">等待操作...</pre>
+</div>
+
+<div class="card">
+  <h2>💬 对话</h2>
+  <label>内容</label>
+  <input id="content" value="1+1=?">
+  <label>模型</label>
+  <select id="model">
+    <option value="default">快速模式</option>
+    <option value="expert">专家模式</option>
+    <option value="vision">识图模式</option>
+  </select>
+  <div class="row" style="margin-top:8px">
+    <label><input type="checkbox" id="thinking" checked> 深度思考</label>
+    <label><input type="checkbox" id="search"> 智能搜索</label>
+  </div>
+  <button class="btn-success" onclick="chat()">发送</button>
+  <button class="btn-warning" onclick="chatStream()" style="margin-top:8px">流式发送</button>
+  <pre id="chatResult">等待操作...</pre>
+</div>
+
+<div class="card response-area">
+  <h2>📋 完整响应</h2>
+  <pre id="rawResponse">{}</pre>
+</div>
+
+<script>
+const BASE = 'http://localhost:8888'
+
+function $(id) { return document.getElementById(id) }
+
+async function api(method, path, body) {
+  const opt = { method, headers: {'Content-Type':'application/json'} }
+  if (body) opt.body = JSON.stringify(body)
+  const r = await fetch(`${BASE}${path}`, opt)
+  const text = await r.text()
+  try { return { status: r.status, data: JSON.parse(text) } }
+  catch { return { status: r.status, data: text } }
+}
+
+async function login() {
+  const r = await api('POST', '/v1/deepseek/login', {
+    mobile: $('mobile').value, password: $('password').value
+  })
+  $('loginResult').textContent = JSON.stringify(r.data, null, 2)
+  $('rawResponse').textContent = JSON.stringify(r, null, 2)
+}
+
+async function logout() {
+  const r = await api('POST', '/v1/deepseek/logout')
+  $('loginResult').textContent = JSON.stringify(r.data, null, 2)
+  $('rawResponse').textContent = JSON.stringify(r, null, 2)
+}
+
+async function chat() {
+  const r = await api('POST', '/v1/deepseek/chat', {
+    content: $('content').value,
+    model: $('model').value,
+    thinking_enabled: $('thinking').checked,
+    search_enabled: $('search').checked,
+    stream: false,
+  })
+  const data = r.data?.data
+  let html = ''
+  if (data?.thinking) html += `<div class="thinking-block">💭 ${data.thinking}</div>`
+  html += `<div>${data?.content || JSON.stringify(r.data)}</div>`
+  $('chatResult').innerHTML = html
+  $('rawResponse').textContent = JSON.stringify(r, null, 2)
+}
+
+async function chatStream() {
+  const resp = await fetch(`${BASE}/v1/deepseek/chat`, {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({
+      content: $('content').value,
+      model: $('model').value,
+      thinking_enabled: $('thinking').checked,
+      search_enabled: $('search').checked,
+      stream: true,
+    }),
+  })
+  if (!resp.ok) { $('chatResult').textContent = `HTTP ${resp.status}`; return }
+
+  const sessionId = resp.headers.get('x-session-id') || '无'
+  const reader = resp.body.getReader()
+  const decoder = new TextDecoder()
+  let result = ''
+  let think = ''
+  let inThink = false
+
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    const text = decoder.decode(value)
+    const lines = text.split('\n')
+    for (const line of lines) {
+      if (!line.startsWith('data: ')) continue
+      const data = line.slice(6).trim()
+      if (data === '[DONE]') continue
+      try {
+        const d = JSON.parse(data)
+        const delta = d.choices?.[0]?.delta
+        if (delta?.thinking) { inThink = true; think += delta.content || '' }
+        else if (delta?.content) {
+          if (inThink) { inThink = false; result += '\n' }
+          result += delta.content
+        }
+      } catch {}
+    }
+  }
+
+  let html = ''
+  if (think) html += `<div class="thinking-block">💭 ${think}</div>`
+  html += `<div>${result}</div>`
+  html += `<div style="font-size:12px;color:#999;margin-top:8px">session-id: ${sessionId}</div>`
+  $('chatResult').innerHTML = html
+  $('rawResponse').textContent = `session-id: ${sessionId}\n\n${JSON.stringify({think, result}, null, 2)}`
+}
+</script>
+</body>
+</html>

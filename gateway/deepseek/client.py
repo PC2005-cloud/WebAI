@@ -462,14 +462,27 @@ class _DeepSeekHTTPClient:
                     else:
                         content_parts.append(v)
             elif p == "response/fragments" and isinstance(v, list) and v:
-                last_type = v[-1].get("type") if isinstance(v[-1], dict) else None
-                if last_type:
-                    current_type = last_type
+                for frag in v:
+                    if isinstance(frag, dict):
+                        current_type = frag.get("type", current_type)
+                        frag_content = frag.get("content", "")
+                        if frag_content:
+                            if current_type == "THINK":
+                                thinking_parts.append(frag_content)
+                            else:
+                                content_parts.append(frag_content)
             elif not p and isinstance(v, dict) and "response" in v:
                 resp_obj = v.get("response", {})
                 frags = resp_obj.get("fragments", [])
-                if frags:
-                    current_type = frags[-1].get("type", current_type)
+                for frag in frags:
+                    if isinstance(frag, dict):
+                        current_type = frag.get("type", current_type)
+                        frag_content = frag.get("content", "")
+                        if frag_content:
+                            if current_type == "THINK":
+                                thinking_parts.append(frag_content)
+                            else:
+                                content_parts.append(frag_content)
 
         content = "".join(content_parts).strip()
         thinking = "".join(thinking_parts).strip() if thinking_enabled else ""
@@ -617,14 +630,21 @@ class _DeepSeekHTTPClient:
                                 is_think = current_type == "THINK"
                                 output_queue.put((v, is_think))
                         elif p == "response/fragments" and isinstance(v, list) and v:
-                            last_type = v[-1].get("type") if isinstance(v[-1], dict) else None
-                            if last_type:
-                                current_type = last_type
+                            for frag in v:
+                                if isinstance(frag, dict):
+                                    current_type = frag.get("type", current_type)
+                                    fc = frag.get("content", "")
+                                    if fc:
+                                        output_queue.put((fc, current_type == "THINK"))
                         elif not p and isinstance(v, dict) and "response" in v:
                             resp_obj = v.get("response", {})
                             frags = resp_obj.get("fragments", [])
-                            if frags:
-                                current_type = frags[-1].get("type", current_type)
+                            for frag in frags:
+                                if isinstance(frag, dict):
+                                    current_type = frag.get("type", current_type)
+                                    fc = frag.get("content", "")
+                                    if fc:
+                                        output_queue.put((fc, current_type == "THINK"))
 
             if auto_clean:
                 self.delete_session(session_id)
