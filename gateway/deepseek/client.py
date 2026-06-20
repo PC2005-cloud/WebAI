@@ -42,8 +42,10 @@ from __future__ import annotations
 
 import json
 import logging
+import queue
+import threading
 import time
-from typing import Optional
+from typing import Callable, Optional
 from urllib.parse import urljoin
 
 import httpx
@@ -449,6 +451,78 @@ class _DeepSeekHTTPClient:
             "[流式API] 完成 (%.1fs, %d 块)", time.monotonic() - t0, len(chunks),
         )
         return chunks
+
+    def _stream_to_queue(
+        self,
+        session_id: str,
+        prompt: str,
+        model_type: str,
+        pow_header: str,
+        output_queue: queue.Queue,
+        thinking_enabled: bool = True,
+        search_enabled: bool = False,
+    ) -> None:
+        """在线程中完成完整流式请求：创建 session → PoW → HTTP 流式读取。
+
+        每得到一个 chunk 就放入 output_queue。
+        结束后放入 None 作为结束标记。
+        """
+        try:
+            # 创建 session（如果未传入）
+            if not session_id:
+                sid_resp = httpx.post(
+                    urljoin(BASE_URL, _SESSION_URL), json={},
+                    headers={"Authorization": f"Bearer {self._token}"},
+                    timeout=_HTTP_TIMEOUT,
+                )
+                if sid_resp.status_code == 401:
+                    raise SessionExpiredError("Token 已过期，请重新登录")
+                sid_resp.raise_for_status()
+                session_id = sid_resp.json()["data"]["biz_data"]["id"]
+
+            # 获取 PoW（如果未传入）
+            if not pow_header:
+                pow_header = self._pow_solver.solve()
+
+            # 发起流式 HTTP 请求
+            url = urljoin(BASE_URL, _COMPLETION_URL)
+            body = self._build_completion_body(
+                session_id, prompt, model_type, thinking_enabled, search_enabled,
+            )
+            headers = self._build_completion_headers(pow_header, self._token, session_id)
+
+            with httpx.Client(timeout=_HTTP_TIMEOUT) as client:
+                with client.stream("POST", url, json=body, headers=headers) as resp:
+                    if resp.status_code == 401:
+                        raise SessionExpiredError("Token 已过期，请重新登录")
+                    resp.raise_for_status()
+
+                    last_p = ""
+                    for line in resp.iter_lines():
+                        if not line or not line.startswith("data: "):
+                            continue
+                        s = line[6:].strip()
+                        if not s:
+                            continue
+                        try:
+                            d = json.loads(s)
+                        except json.JSONDecodeError:
+                            continue
+
+                        p = d.get("p") or last_p
+                        v = d.get("v")
+                        o = d.get("o")
+                        if p:
+                            last_p = p
+
+                        if isinstance(v, str) and p == "response/fragments/-1/content":
+                            if o == "APPEND" or not o:
+                                output_queue.put(v)
+        except Exception as exc:
+            logger.error("[流式] 线程错误: %s", exc)
+            output_queue.put(f"[error: {exc}]")
+        finally:
+            output_queue.put(None)
 
     # --------------------------------------------------
     # 请求体/头构建（ask 和 ask_stream 复用）

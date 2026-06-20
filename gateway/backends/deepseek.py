@@ -30,8 +30,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import AsyncGenerator
+
+# Playwright 不是线程安全的，使用专用单线程执行所有 PoW 操作
+_pow_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pow")
 
 from fastapi import APIRouter
 from pydantic import BaseModel, Field
@@ -40,7 +45,7 @@ from fastapi.responses import StreamingResponse
 from core.response import Result
 from gateway.backends import register
 from gateway.backends.base import BaseBackend
-from gateway.deepseek.client import _DeepSeekHTTPClient
+from gateway.deepseek.client import _DeepSeekHTTPClient, _model_type_from_user_model
 
 logger = logging.getLogger(__name__)
 
@@ -206,7 +211,8 @@ class DeepSeekBackend(BaseBackend):
         await self._ensure_client()
         if stream:
             return self._stream_response(content, model)
-        return await asyncio.to_thread(self._client.ask, content, model)
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(_pow_executor, self._client.ask, content, model)
 
     async def check_health(self) -> bool:
         try:
@@ -228,29 +234,56 @@ class DeepSeekBackend(BaseBackend):
                 return
             logger.info("[初始化] 启动 DeepSeek 客户端 ...")
             client = _DeepSeekHTTPClient()
-            await asyncio.to_thread(client.start)
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(_pow_executor, client.start)
             self._client = client
             logger.info("[初始化] DeepSeek 客户端就绪")
 
     async def _handle_normal(self, req: ChatRequest) -> dict:
         from core.response import Result
 
-        content = await asyncio.to_thread(
-            self._client.ask, req.content, req.model,
+        loop = asyncio.get_running_loop()
+        content = await loop.run_in_executor(
+            _pow_executor, self._client.ask, req.content, req.model,
             req.thinking_enabled, req.search_enabled,
         )
         logger.info("[响应] 非流式完成, %d字符", len(content))
         return Result.success(content)
 
     async def _handle_stream(self, req: ChatRequest) -> StreamingResponse:
-        chunks = await asyncio.to_thread(
-            self._client.ask_stream, req.content, req.model,
-            req.thinking_enabled, req.search_enabled,
+        import queue as q_mod
+        loop = asyncio.get_running_loop()
+
+        _t0 = time.monotonic()
+        session_id = await asyncio.to_thread(self._client._create_session)
+        _t1 = time.monotonic()
+        pow_header = await loop.run_in_executor(_pow_executor, self._client._pow_solver.solve)
+        _t2 = time.monotonic()
+        model_type = _model_type_from_user_model(req.model)
+        logger.info("[流式] 会话%.1fs PoW%.1fs 总计%.1fs",
+                     _t1 - _t0, _t2 - _t1, _t2 - _t0)
+
+        sync_queue = q_mod.Queue()
+        thread = threading.Thread(
+            target=self._client._stream_to_queue,
+            args=(
+                session_id, req.content, model_type, pow_header,
+                sync_queue, req.thinking_enabled, req.search_enabled,
+            ),
+            daemon=True,
         )
-        logger.info("[响应] 流式完成, %d块", len(chunks))
+        thread.start()
 
         async def event_generator():
-            for chunk in chunks:
+            chunk_count = 0
+            first_t = None
+            while True:
+                chunk = await asyncio.to_thread(sync_queue.get)
+                if chunk is None:
+                    break
+                if first_t is None:
+                    first_t = time.monotonic()
+                chunk_count += 1
                 data = {
                     "id": "chatcmpl-deepseek",
                     "object": "chat.completion.chunk",
@@ -259,7 +292,9 @@ class DeepSeekBackend(BaseBackend):
                     "choices": [{"index": 0, "delta": {"content": chunk}, "finish_reason": None}],
                 }
                 yield f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
-            # 结束标记
+
+            stream_t = time.monotonic() - (first_t or _t0)
+            logger.info("[流式] 完成: %d块 流式%.1fs", chunk_count, stream_t)
             data = {
                 "id": "chatcmpl-deepseek",
                 "object": "chat.completion.chunk",
@@ -278,6 +313,7 @@ class DeepSeekBackend(BaseBackend):
     async def _stream_response(
         self, content: str, model: str,
     ) -> AsyncGenerator[str, None]:
-        chunks = await asyncio.to_thread(self._client.ask_stream, content, model)
+        loop = asyncio.get_running_loop()
+        chunks = await loop.run_in_executor(_pow_executor, self._client.ask_stream, content, model)
         for chunk in chunks:
             yield chunk
