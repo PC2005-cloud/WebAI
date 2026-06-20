@@ -79,6 +79,16 @@ class ChatRequest(BaseModel):
     )
 
 
+class ChatResponse(BaseModel):
+    """对话响应体。"""
+
+    content: str = Field(description="AI 回复文本")
+    thinking: str | None = Field(
+        None,
+        description="深度思考的思维链内容，未开启思考时为 null",
+    )
+
+
 # ============================================================
 # 后端适配器
 # ============================================================
@@ -147,7 +157,7 @@ class DeepSeekBackend(BaseBackend):
     | vision | 识图模式 | ✅ | ❌ |
     """,
             tags=["DeepSeek"],
-            response_model=Result,
+            response_model=Result[ChatResponse],
             responses={
                 200: {"description": "对话成功"},
                 402: {"description": "未登录或 token 过期"},
@@ -243,12 +253,16 @@ class DeepSeekBackend(BaseBackend):
         from core.response import Result
 
         loop = asyncio.get_running_loop()
-        content = await loop.run_in_executor(
+        result = await loop.run_in_executor(
             _pow_executor, self._client.ask, req.content, req.model,
             req.thinking_enabled, req.search_enabled,
         )
-        logger.info("[响应] 非流式完成, %d字符", len(content))
-        return Result.success(content)
+        content, thinking = result if isinstance(result, tuple) else (result, "")
+        logger.info("[响应] 非流式完成, %d字符 思考%d字符", len(content), len(thinking))
+
+        return Result.success(
+            ChatResponse(content=content, thinking=thinking or None)
+        )
 
     async def _handle_stream(self, req: ChatRequest) -> StreamingResponse:
         import queue as q_mod
@@ -278,7 +292,8 @@ class DeepSeekBackend(BaseBackend):
             chunk_count = 0
             first_t = None
             while True:
-                chunk = await asyncio.to_thread(sync_queue.get)
+                item = await asyncio.to_thread(sync_queue.get)
+                chunk, is_think = item if isinstance(item, tuple) else (item, False)
                 if chunk is None:
                     break
                 if first_t is None:
@@ -289,7 +304,7 @@ class DeepSeekBackend(BaseBackend):
                     "object": "chat.completion.chunk",
                     "created": int(time.time()),
                     "model": req.model,
-                    "choices": [{"index": 0, "delta": {"content": chunk}, "finish_reason": None}],
+                    "choices": [{"index": 0, "delta": {"content": chunk, "thinking": is_think}, "finish_reason": None}],
                 }
                 yield f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
 

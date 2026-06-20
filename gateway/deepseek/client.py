@@ -57,7 +57,7 @@ from core.exceptions import (
 )
 from gateway.deepseek.pow import PowSolver
 from gateway.deepseek.session import load_token
-from gateway.deepseek.sse import extract_content_from_sse
+from gateway.deepseek.sse import extract_content_from_sse, extract_thinking_from_sse
 
 logger = logging.getLogger(__name__)
 
@@ -231,17 +231,17 @@ class _DeepSeekHTTPClient:
         t1 = time.monotonic()
         pow_header = self._pow_solver.solve()
         t2 = time.monotonic()
-        result = self._send_completion(
+        text_content, thinking = self._send_completion(
             sid, content, model_type, pow_header,
             thinking_enabled, search_enabled,
         )
         t3 = time.monotonic()
 
         logger.info(
-            "[对话] 完成 (%.1fs | 会话%.1fs PoW%.1fs HTTP%.1fs | %d字符)",
-            t3 - t0, t1 - t0, t2 - t1, t3 - t2, len(result),
+            "[对话] 完成 (%.1fs | 会话%.1fs PoW%.1fs HTTP%.1fs | %d字符 思考%d字符)",
+            t3 - t0, t1 - t0, t2 - t1, t3 - t2, len(text_content), len(thinking),
         )
-        return result
+        return (text_content, thinking)
 
     def ask_stream(
         self,
@@ -378,13 +378,52 @@ class _DeepSeekHTTPClient:
                 f"对话请求失败 (HTTP {resp.status_code}): {resp.text[:300]}"
             ) from exc
 
-        content = extract_content_from_sse(resp.text)
+        # 解析 SSE，分离 thinking 和 content
+        content_parts = []
+        thinking_parts = []
+        current_type = None
+        last_p = ""
+        for line in resp.text.split("\n"):
+            if not line.startswith("data: "):
+                continue
+            s = line[6:].strip()
+            if not s:
+                continue
+            try:
+                d = json.loads(s)
+            except json.JSONDecodeError:
+                continue
+            p = d.get("p") or last_p
+            v = d.get("v")
+            o = d.get("o")
+            if p:
+                last_p = p
+
+            # 追踪 fragment 类型
+            if p == "response/fragments/-1/content" and isinstance(v, str):
+                if o == "APPEND" or not o:
+                    if current_type == "THINK":
+                        thinking_parts.append(v)
+                    else:
+                        content_parts.append(v)
+            elif p == "response/fragments" and isinstance(v, list) and v:
+                last_type = v[-1].get("type") if isinstance(v[-1], dict) else None
+                if last_type:
+                    current_type = last_type
+            elif not p and isinstance(v, dict) and "response" in v:
+                resp_obj = v.get("response", {})
+                frags = resp_obj.get("fragments", [])
+                if frags:
+                    current_type = frags[-1].get("type", current_type)
+
+        content = "".join(content_parts).strip()
+        thinking = "".join(thinking_parts).strip() if thinking_enabled else ""
         parse_elapsed = time.monotonic() - t0 - http_elapsed
         logger.debug(
-            "[API] 对话完成 (%.1fs | HTTP %.1fs 解析 %.2fs | %d 字符)",
-            time.monotonic() - t0, http_elapsed, parse_elapsed, len(content),
+            "[API] 对话完成 (%.1fs | HTTP %.1fs 解析 %.2fs | %d字符 思考%d字符)",
+            time.monotonic() - t0, http_elapsed, parse_elapsed, len(content), len(thinking),
         )
-        return content
+        return (content, thinking)
 
     def _stream_completion(
         self,
@@ -498,6 +537,7 @@ class _DeepSeekHTTPClient:
                     resp.raise_for_status()
 
                     last_p = ""
+                    current_type = None
                     for line in resp.iter_lines():
                         if not line or not line.startswith("data: "):
                             continue
@@ -515,14 +555,25 @@ class _DeepSeekHTTPClient:
                         if p:
                             last_p = p
 
+                        # 追踪当前 fragment 类型（THINK / RESPONSE）
                         if isinstance(v, str) and p == "response/fragments/-1/content":
                             if o == "APPEND" or not o:
-                                output_queue.put(v)
+                                is_think = current_type == "THINK"
+                                output_queue.put((v, is_think))
+                        elif p == "response/fragments" and isinstance(v, list) and v:
+                            last_type = v[-1].get("type") if isinstance(v[-1], dict) else None
+                            if last_type:
+                                current_type = last_type
+                        elif not p and isinstance(v, dict) and "response" in v:
+                            resp_obj = v.get("response", {})
+                            frags = resp_obj.get("fragments", [])
+                            if frags:
+                                current_type = frags[-1].get("type", current_type)
         except Exception as exc:
             logger.error("[流式] 线程错误: %s", exc)
-            output_queue.put(f"[error: {exc}]")
+            output_queue.put(("[error]", False))
         finally:
-            output_queue.put(None)
+            output_queue.put((None, False))
 
     # --------------------------------------------------
     # 请求体/头构建（ask 和 ask_stream 复用）
