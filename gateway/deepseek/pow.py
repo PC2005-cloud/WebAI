@@ -180,12 +180,8 @@ class PowSolver:
         if not self._page:
             raise RuntimeError("PoW 浏览器未启动，请先调用 start()")
 
-        # 1. 确保页面在首页（已经在首页就跳过导航）
-        try:
-            if BASE_URL not in self._page.url:
-                self._navigate_home()
-        except Exception:
-            self._navigate_home()
+        # 1. 确保页面在首页，textarea 可用
+        self._navigate_home()
 
         # 2. 在 textarea 输入并回车，触发 PoW
         ta = self._page.query_selector('textarea[name="search"]')

@@ -175,6 +175,17 @@ class _DeepSeekHTTPClient:
         self._started = True
         logger.info("[客户端] DeepSeek HTTP 客户端就绪")
 
+    def logout(self) -> bool:
+        """退出登录：删除本地 session 文件。"""
+        import os
+        path = "session/deepseek.json"
+        if os.path.isfile(path):
+            os.remove(path)
+            logger.info("[客户端] session 已删除")
+            return True
+        logger.warning("[客户端] session 文件不存在")
+        return False
+
     def close(self) -> None:
         """释放所有资源。"""
         self._pow_stop.set()
@@ -190,7 +201,7 @@ class _DeepSeekHTTPClient:
             try:
                 if self._pow_queue.qsize() < 2:
                     future = self._pow_executor.submit(self._pow_solver.solve)
-                    new_pow = future.result(timeout=60)
+                    new_pow = future.result(timeout=120)
                     self._pow_queue.put(new_pow, timeout=5)
                     logger.debug("[PoW] 队列补一个 (%d个)", self._pow_queue.qsize())
                 else:

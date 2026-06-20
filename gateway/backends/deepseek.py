@@ -46,6 +46,7 @@ from core.response import Result
 from gateway.backends import register
 from gateway.backends.base import BaseBackend
 from gateway.deepseek.client import _DeepSeekHTTPClient, _model_type_from_user_model
+from gateway.deepseek.session import login_with_password
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +88,13 @@ class DeleteRequest(BaseModel):
     """删除对话请求体。"""
 
     session_id: str = Field(description="要删除的对话 session ID")
+
+
+class LoginRequest(BaseModel):
+    """密码登录请求体。"""
+
+    mobile: str = Field(description="手机号")
+    password: str = Field(description="密码")
 
 
 class ChatResponse(BaseModel):
@@ -187,6 +195,26 @@ class DeepSeekBackend(BaseBackend):
         )
 
         router.add_api_route(
+            f"{prefix}/login",
+            self.login_endpoint,
+            methods=["POST"],
+            summary="密码登录",
+            description="通过手机号+密码登录，自动保存 session。",
+            tags=["DeepSeek"],
+            response_model=Result,
+        )
+
+        router.add_api_route(
+            f"{prefix}/logout",
+            self.logout_endpoint,
+            methods=["POST"],
+            summary="退出登录",
+            description="清除本地登录态，下次使用需重新 --mode login。",
+            tags=["DeepSeek"],
+            response_model=Result,
+        )
+
+        router.add_api_route(
             f"{prefix}/session/delete",
             self.delete_session_endpoint,
             methods=["POST"],
@@ -227,6 +255,31 @@ class DeepSeekBackend(BaseBackend):
         """GET /v1/deepseek/models"""
         from core.response import Result
         return Result.success(self.models)
+
+    async def login_endpoint(self, req: LoginRequest):
+        """POST /v1/deepseek/login"""
+        from core.response import Result
+        try:
+            ok = await asyncio.to_thread(
+                login_with_password, req.mobile, req.password
+            )
+            return Result.success(None) if ok else Result.error("登录失败，请检查账号密码")
+        except Exception as exc:
+            return Result.error(str(exc))
+
+    async def logout_endpoint(self):
+        """POST /v1/deepseek/logout"""
+        from core.response import Result
+        try:
+            if self._client is not None:
+                await asyncio.to_thread(self._client.logout)
+            else:
+                import os
+                if os.path.isfile("session/deepseek.json"):
+                    os.remove("session/deepseek.json")
+            return Result.success(None)
+        except Exception as exc:
+            return Result.error(str(exc))
 
     async def delete_session_endpoint(self, req: DeleteRequest):
         """POST /v1/deepseek/session/delete"""

@@ -296,3 +296,81 @@ def login_cli(timeout_seconds: int = 120) -> None:
             logger.debug("[登录] Playwright 已关闭")
         except Exception:
             pass
+
+
+def login_with_password(mobile: str, password: str, area_code: str = "+86") -> bool:
+    """通过手机号密码登录，保存 session 文件。
+
+    POST /api/v0/users/login
+    """
+    import httpx
+    import uuid
+
+    url = f"{BASE_URL}/api/v0/users/login"
+    device_id = str(uuid.uuid4())
+
+    body = {
+        "email": "",
+        "mobile": mobile,
+        "password": password,
+        "area_code": area_code,
+        "device_id": device_id,
+        "os": "web",
+    }
+
+    logger.info("[密码登录] 正在登录 %s%s ...", area_code, mobile[-4:])
+    r = httpx.post(url, json=body, timeout=30)
+    data = r.json()
+
+    biz_code = data.get("data", {}).get("biz_code")
+    if biz_code != 0:
+        msg = data.get("data", {}).get("biz_msg", "未知错误")
+        logger.error("[密码登录] 失败: %s", msg)
+        return False
+
+    # 提取 token（在 biz_data.user.token 中）
+    biz_data = data.get("data", {}).get("biz_data", {})
+    user = biz_data.get("user", {})
+    token = user.get("token", "")
+    if not token:
+        logger.error("[密码登录] 响应中未找到 token")
+        return False
+
+    # 保存为 storage_state 格式（兼容 load_token）
+    import json
+    import http.cookies as http_cookies
+
+    # 提取响应中的 cookies
+    cookies_list = []
+    for cookie in r.cookies.jar:
+        cookies_list.append({
+            "name": cookie.name,
+            "value": cookie.value,
+            "domain": cookie.domain or "chat.deepseek.com",
+            "path": cookie.path or "/",
+            "expires": int(cookie.expires) if cookie.expires else -1,
+            "httpOnly": cookie.has_nonstandard_attr("httponly"),
+            "secure": cookie.secure,
+            "sameSite": "Lax",
+        })
+
+    storage = {
+        "cookies": cookies_list,
+        "origins": [
+            {
+                "origin": BASE_URL,
+                "localStorage": [
+                    {
+                        "name": "userToken",
+                        "value": json.dumps({"value": token, "__version": "0"}),
+                    }
+                ],
+            }
+        ],
+    }
+    os.makedirs(os.path.dirname(SESSION_FILE), exist_ok=True)
+    with open(SESSION_FILE, "w", encoding="utf-8") as f:
+        json.dump(storage, f, indent=2)
+
+    logger.info("[密码登录] 成功，token + %d 个 cookie 已保存", len(cookies_list))
+    return True
