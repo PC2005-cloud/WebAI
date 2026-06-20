@@ -143,7 +143,11 @@ class PowSolver:
         # 6-7. 加载首页
         logger.debug("[PoW] 正在加载 %s", BASE_URL)
         self._page.goto(BASE_URL, wait_until="domcontentloaded")
-        self._page.wait_for_timeout(10000)
+        self._page.wait_for_selector(
+            'textarea[name="search"]',
+            state="visible",
+            timeout=15000,
+        )
 
         elapsed = time.monotonic() - t0
         logger.info("[PoW] 浏览器就绪（%.1fs）", elapsed)
@@ -176,8 +180,12 @@ class PowSolver:
         if not self._page:
             raise RuntimeError("PoW 浏览器未启动，请先调用 start()")
 
-        # 1. 确保页面在首页
-        self._navigate_home()
+        # 1. 确保页面在首页（已经在首页就跳过导航）
+        try:
+            if BASE_URL not in self._page.url:
+                self._navigate_home()
+        except Exception:
+            self._navigate_home()
 
         # 2. 在 textarea 输入并回车，触发 PoW
         ta = self._page.query_selector('textarea[name="search"]')
@@ -212,7 +220,7 @@ class PowSolver:
         elapsed = time.monotonic() - t0
         logger.info("[PoW] 计算完成（%.1fs）", elapsed)
 
-        # 4. 导航回首页，下次复用
+        # 重置页面状态，下次复用
         self._navigate_home()
 
         return _pow_header  # type: ignore[return-value]
@@ -227,7 +235,11 @@ class PowSolver:
             return
         try:
             self._page.goto(BASE_URL, wait_until="domcontentloaded")
-            self._page.wait_for_timeout(3000)
+            self._page.wait_for_selector(
+                'textarea[name="search"]',
+                state="visible",
+                timeout=5000,
+            )
             logger.debug("[PoW] 已导航回首页")
         except Exception as exc:
             logger.warning("[PoW] 导航回首页失败: %s", exc)

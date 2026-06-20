@@ -56,7 +56,6 @@ from core.exceptions import (
 from gateway.deepseek.pow import PowSolver
 from gateway.deepseek.session import load_token
 from gateway.deepseek.sse import extract_content_from_sse
-from gateway.schemas import MessageList
 
 logger = logging.getLogger(__name__)
 
@@ -75,8 +74,21 @@ _HTTP_TIMEOUT = 300.0  # AI 长回答超时（秒）
 # 请求头中使用的 User-Agent
 _USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/148.0.0.0 Safari/537.36"
 )
+
+# 新版 API 要求的客户端标识头
+_CLIENT_HEADERS = {
+    "Origin": BASE_URL,
+    "Accept": "*/*",
+    "X-App-Version": "2.0.0",
+    "X-Client-Bundle-Id": "com.deepseek.chat",
+    "X-Client-Locale": "zh_CN",
+    "X-Client-Platform": "web",
+    "X-Client-Timezone-Offset": "28800",
+    "X-Client-Version": "2.0.0",
+}
 
 
 # ============================================================
@@ -84,49 +96,20 @@ _USER_AGENT = (
 # ============================================================
 
 
-def _build_prompt(messages: MessageList) -> str:
-    """将消息列表拼接为纯文本提示词。
-
-    每个消息按角色添加标签，全部拼接后发给 DeepSeek 网页版 API。
-
-    Args:
-        messages: 消息列表（Message 对象）
-
-    Returns:
-        拼接后的纯文本
-    """
-    parts = []
-    for msg in messages:
-        role = msg.role
-        content = msg.content
-        if role == "system":
-            parts.append(f"[系统指令]\n{content}")
-        elif role == "user":
-            parts.append(f"[用户]\n{content}")
-        elif role == "assistant":
-            parts.append(f"[助手]\n{content}")
-        elif role == "tool":
-            parts.append(f"[工具执行结果]\n{content}")
-        else:
-            parts.append(f"[{role}]\n{content}")
-    return "\n\n".join(parts)
-
-
 def _model_type_from_user_model(model: str) -> str:
-    """将用户可见的模型名映射为 API 的 model_type 参数。
-
-    映射关系:
-        "default"  → "default"  （快速模式）
-        "thinking" → "expert"   （专家模式，旧名 R1/思考）
-        其他       → "default"  （默认）
+    """验证并返回 model_type，直接透传。
 
     Args:
         model: 用户请求中传入的模型 ID
 
     Returns:
-        API 可接受的 model_type 值
+        API 可接受的 model_type 值（default/expert/vision）
     """
-    return "expert" if model == "thinking" else "default"
+    allowed = ("default", "expert", "vision")
+    if model not in allowed:
+        logger.warning("[模型] 未知模型 '%s'，使用 default", model)
+        return "default"
+    return model
 
 
 # ============================================================
@@ -217,104 +200,80 @@ class _DeepSeekHTTPClient:
     # 核心 API
     # --------------------------------------------------
 
-    def ask(self, messages: MessageList, model: str = "default") -> str:
+    def ask(
+        self,
+        content: str,
+        model: str = "default",
+        thinking_enabled: bool = True,
+        search_enabled: bool = False,
+    ) -> str:
         """发送对话消息，返回完整响应文本。
 
-        这是非流式接口——等待完整响应后一次性返回。
-
         Args:
-            messages: OpenAI 格式的消息列表
-            model: 模型名（"default"/"thinking"）
-
-        Returns:
-            响应文本（已去除首尾空白）
-
-        Raises:
-            RuntimeError: 客户端未调用 start()
-            SessionExpiredError: token 过期或无效
-            PowTimeoutError: PoW 计算超时
-            BackendNotAvailableError: DeepSeek 后端返回错误
+            content: 用户输入文本
+            model: 模型名（default / expert / vision）
+            thinking_enabled: 是否开启深度思考
+            search_enabled: 是否开启智能搜索
         """
         if not self._started:
             raise RuntimeError("客户端未启动，请先调用 start()")
 
-        prompt = _build_prompt(messages)
         model_type = _model_type_from_user_model(model)
         logger.info(
-            "[对话] 开始请求 model=%s messages=%d条 prompt=%d字符",
-            model_type, len(messages), len(prompt),
+            "[对话] model=%s think=%s search=%s prompt=%d字符",
+            model_type, thinking_enabled, search_enabled, len(content),
         )
 
-        t_start = time.monotonic()
-
-        # 1. 创建会话
+        t0 = time.monotonic()
         sid = self._create_session()
-        t_session = time.monotonic()
-
-        # 2. 获取 PoW
+        t1 = time.monotonic()
         pow_header = self._pow_solver.solve()
-        t_pow = time.monotonic()
-
-        # 3. 发送对话
-        content = self._send_completion(sid, prompt, model_type, pow_header)
-        t_done = time.monotonic()
+        t2 = time.monotonic()
+        result = self._send_completion(
+            sid, content, model_type, pow_header,
+            thinking_enabled, search_enabled,
+        )
+        t3 = time.monotonic()
 
         logger.info(
-            "[对话] 完成 | 会话=%.1fs PoW=%.1fs HTTP=%.1fs 总计=%.1fs | 响应=%d字符",
-            t_session - t_start,
-            t_pow - t_session,
-            t_done - t_pow,
-            t_done - t_start,
-            len(content),
+            "[对话] 完成 (%.1fs | 会话%.1fs PoW%.1fs HTTP%.1fs | %d字符)",
+            t3 - t0, t1 - t0, t2 - t1, t3 - t2, len(result),
         )
-        return content
+        return result
 
     def ask_stream(
-        self, messages: MessageList, model: str = "default"
+        self,
+        content: str,
+        model: str = "default",
+        thinking_enabled: bool = True,
+        search_enabled: bool = False,
     ) -> list[str]:
         """发送对话消息，返回内容块列表（流式模式用）。
 
-        返回预收集的 list[str] 而非实时生成器，
-        因为 httpx 同步请求必须先等完整响应才能解析。
-
-        FastAPI 端拿到列表后再用 SSE EventSourceResponse 逐块发送。
-
         Args:
-            messages: OpenAI 格式的消息列表
+            content: 用户输入文本
             model: 模型名
-
-        Returns:
-            内容文本块列表
+            thinking_enabled: 深度思考
+            search_enabled: 智能搜索
         """
         if not self._started:
             raise RuntimeError("客户端未启动，请先调用 start()")
 
-        prompt = _build_prompt(messages)
         model_type = _model_type_from_user_model(model)
         logger.info(
-            "[流式] 开始请求 model=%s messages=%d条 prompt=%d字符",
-            model_type, len(messages), len(prompt),
+            "[流式] model=%s think=%s search=%s prompt=%d字符",
+            model_type, thinking_enabled, search_enabled, len(content),
         )
 
-        t_start = time.monotonic()
-
-        # 1-2. 创建会话 + PoW
+        t0 = time.monotonic()
         sid = self._create_session()
         pow_header = self._pow_solver.solve()
-        t_ready = time.monotonic()
-
-        # 3. 发送对话并逐行流式解析
-        chunks = self._stream_completion(sid, prompt, model_type, pow_header)
-        t_done = time.monotonic()
-
-        logger.info(
-            "[流式] 完成 | 准备=%.1fs 传输=%.1fs 总计=%.1fs | %d块 %d字符",
-            t_ready - t_start,
-            t_done - t_ready,
-            t_done - t_start,
-            len(chunks),
-            sum(len(c) for c in chunks),
+        chunks = self._stream_completion(
+            sid, content, model_type, pow_header,
+            thinking_enabled, search_enabled,
         )
+
+        logger.info("[流式] 完成 (%.1fs, %d 块)", time.monotonic() - t0, len(chunks))
         return chunks
 
     # --------------------------------------------------
@@ -337,27 +296,29 @@ class _DeepSeekHTTPClient:
         url = urljoin(BASE_URL, _SESSION_URL)
         logger.debug("[API] 创建 session ...")
 
+        t0 = time.monotonic()
         resp = httpx.post(
             url,
             json={},
             headers={"Authorization": f"Bearer {self._token}"},
             timeout=_HTTP_TIMEOUT,
         )
+        session_elapsed = time.monotonic() - t0
 
         if resp.status_code == 401:
-            logger.warning("[API] 创建 session 返回 401，token 可能已过期")
+            logger.warning("[API] 创建 session 返回 401，token 可能已过期 (%.2fs)", session_elapsed)
             raise SessionExpiredError("Token 已过期，请重新登录")
 
         try:
             resp.raise_for_status()
             data = resp.json()
             sid = data["data"]["biz_data"]["id"]
-            logger.debug("[API] session 创建成功: %s", sid[:8])
+            logger.debug("[API] session 创建成功: %s (%.2fs)", sid[:8], session_elapsed)
             return sid
         except (KeyError, json.JSONDecodeError) as exc:
             text = resp.text[:500]
             logger.error(
-                "[API] session 响应解析失败: %s | 响应: %s", exc, text
+                "[API] session 响应解析失败: %s | 响应: %s (%.2fs)", exc, text, session_elapsed,
             )
             raise BackendNotAvailableError(
                 f"创建会话失败: {exc}。响应: {text}"
@@ -369,23 +330,31 @@ class _DeepSeekHTTPClient:
         prompt: str,
         model_type: str,
         pow_header: str,
+        thinking_enabled: bool = True,
+        search_enabled: bool = False,
     ) -> str:
-        """发送对话请求并解析 SSE 响应，返回完整文本。
+        """发送对话请求并解析 SSE 响应。
 
         POST /api/v0/chat/completion
 
         Args:
-            session_id: 由上一步 _create_session 获得
-            prompt: 拼接好的提示词文本
-            model_type: "default" / "expert" / "vision"
+            session_id: session ID
+            prompt: 提示词文本
+            model_type: default / expert / vision
             pow_header: x-ds-pow-response 值
+            thinking_enabled: 深度思考
+            search_enabled: 智能搜索
 
         Returns:
             响应文本
         """
         url = urljoin(BASE_URL, _COMPLETION_URL)
-        body = self._build_completion_body(session_id, prompt, model_type)
-        headers = self._build_completion_headers(pow_header, self._token)
+        body = self._build_completion_body(
+            session_id, prompt, model_type, thinking_enabled, search_enabled,
+        )
+        headers = self._build_completion_headers(
+            pow_header, self._token, session_id,
+        )
 
         t0 = time.monotonic()
         logger.debug("[API] 发送对话 (%d 字符) ...", len(prompt))
@@ -393,23 +362,25 @@ class _DeepSeekHTTPClient:
         resp = httpx.post(
             url, json=body, headers=headers, timeout=_HTTP_TIMEOUT,
         )
+        http_elapsed = time.monotonic() - t0
 
         if resp.status_code == 401:
+            logger.warning("[API] 对话请求 401 (%.2fs)", http_elapsed)
             raise SessionExpiredError("Token 已过期，请重新登录")
 
         try:
             resp.raise_for_status()
         except httpx.HTTPStatusError as exc:
+            logger.error("[API] 对话请求失败 HTTP %d (%.2fs)", resp.status_code, http_elapsed)
             raise BackendNotAvailableError(
                 f"对话请求失败 (HTTP {resp.status_code}): {resp.text[:300]}"
             ) from exc
 
-        # 解析 SSE 响应
         content = extract_content_from_sse(resp.text)
-        elapsed = time.monotonic() - t0
+        parse_elapsed = time.monotonic() - t0 - http_elapsed
         logger.debug(
-            "[API] 对话完成 (%.1fs, 响应 %d 字节, 提取 %d 字符)",
-            elapsed, len(resp.text), len(content),
+            "[API] 对话完成 (%.1fs | HTTP %.1fs 解析 %.2fs | %d 字符)",
+            time.monotonic() - t0, http_elapsed, parse_elapsed, len(content),
         )
         return content
 
@@ -419,22 +390,29 @@ class _DeepSeekHTTPClient:
         prompt: str,
         model_type: str,
         pow_header: str,
+        thinking_enabled: bool = True,
+        search_enabled: bool = False,
     ) -> list[str]:
         """发送对话请求并逐行解析 SSE，返回内容块列表。
 
-        与 _send_completion 的区别：
-        - 使用 resp.iter_lines() 逐行读取
-        - 收集每块内容后返回列表（供 EventSourceResponse 使用）
-
         Args:
-            同上 _send_completion
+            session_id: session ID
+            prompt: 提示词文本
+            model_type: default / expert / vision
+            pow_header: x-ds-pow-response 值
+            thinking_enabled: 深度思考
+            search_enabled: 智能搜索
 
         Returns:
             内容文本块列表
         """
         url = urljoin(BASE_URL, _COMPLETION_URL)
-        body = self._build_completion_body(session_id, prompt, model_type)
-        headers = self._build_completion_headers(pow_header, self._token)
+        body = self._build_completion_body(
+            session_id, prompt, model_type, thinking_enabled, search_enabled,
+        )
+        headers = self._build_completion_headers(
+            pow_header, self._token, session_id,
+        )
 
         t0 = time.monotonic()
         logger.debug("[流式API] 发送对话 (%d 字符) ...", len(prompt))
@@ -444,10 +422,8 @@ class _DeepSeekHTTPClient:
         )
         resp.raise_for_status()
 
-        # 逐行解析 SSE
         chunks: list[str] = []
         last_p = ""
-
         for line in resp.iter_lines(decode_unicode=True):
             if not line or not line.startswith("data: "):
                 continue
@@ -465,16 +441,12 @@ class _DeepSeekHTTPClient:
             if p:
                 last_p = p
 
-            if isinstance(v, str) and p == "response/content":
+            if isinstance(v, str) and p == "response/fragments/-1/content":
                 if o == "APPEND" or not o:
                     chunks.append(v)
 
-        elapsed = time.monotonic() - t0
         logger.debug(
-            "[流式API] 完成 (%.1fs, %d 块, %d 字符)",
-            elapsed,
-            len(chunks),
-            sum(len(c) for c in chunks),
+            "[流式API] 完成 (%.1fs, %d 块)", time.monotonic() - t0, len(chunks),
         )
         return chunks
 
@@ -484,43 +456,29 @@ class _DeepSeekHTTPClient:
 
     @staticmethod
     def _build_completion_body(
-        session_id: str, prompt: str, model_type: str
+        session_id: str, prompt: str, model_type: str,
+        thinking_enabled: bool = True, search_enabled: bool = False,
     ) -> dict:
-        """构建 /api/v0/chat/completion 的请求体。
-
-        Args:
-            session_id: 对话 session ID
-            prompt: 提示词文本
-            model_type: 模型类型
-
-        Returns:
-            请求体 dict
-        """
+        """构建 /api/v0/chat/completion 的请求体。"""
         return {
             "chat_session_id": session_id,
             "parent_message_id": None,
             "model_type": model_type,
             "prompt": prompt,
             "ref_file_ids": [],
-            "thinking_enabled": True,
-            "search_enabled": True,
+            "thinking_enabled": thinking_enabled,
+            "search_enabled": search_enabled,
             "action": None,
             "preempt": False,
         }
 
     @staticmethod
-    def _build_completion_headers(pow_header: str, token: str) -> dict:
-        """构建 /api/v0/chat/completion 的请求头。
-
-        Args:
-            pow_header: x-ds-pow-response 值
-            token: Bearer token
-
-        Returns:
-            请求头 dict
-        """
+    def _build_completion_headers(pow_header: str, token: str, session_id: str) -> dict:
+        """构建 /api/v0/chat/completion 的请求头。"""
         return {
             "Authorization": f"Bearer {token}",
             "X-Ds-Pow-Response": pow_header,
+            "Referer": f"{BASE_URL}/a/chat/s/{session_id}",
             "User-Agent": _USER_AGENT,
+            **_CLIENT_HEADERS,
         }

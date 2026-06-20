@@ -28,6 +28,17 @@ from gateway.backends import list_backends, register_all_routes
 
 logger = logging.getLogger(__name__)
 
+# 模块加载时即配置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
+# 抑制 httpx 和 uvicorn.access 的 INFO 日志（太多噪音）
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+
 # ============================================================
 # FastAPI 应用
 # ============================================================
@@ -93,31 +104,16 @@ register_all_routes(app.router)
 # ============================================================
 
 
-def setup_logging(level: int = logging.INFO) -> None:
-    """配置全局日志格式。
-
-    格式说明:
-        timestamp [LEVEL] module_name: message
-    """
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%H:%M:%S",
-    )
-
-
 def cmd_login() -> None:
     """CLI 模式：运行 DeepSeek 登录流程。"""
     from gateway.deepseek.session import login_cli
 
-    setup_logging()
     logger.info("进入登录模式")
     login_cli()
 
 
 def cmd_serve(args: argparse.Namespace) -> None:
     """CLI 模式：启动 FastAPI HTTP 服务。"""
-    setup_logging()
 
     backends = [b["id"] for b in list_backends()]
     logger.info("=" * 50)
@@ -132,6 +128,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
         host=args.host,
         port=args.port,
         reload=args.reload,
+        log_config=None,  # 使用 setup_logging 的配置，不覆盖
     )
 
 
@@ -159,8 +156,8 @@ def main() -> None:
     parser.add_argument(
         "--port",
         type=int,
-        default=8000,
-        help="监听端口（默认: 8000）",
+        default=8888,
+        help="监听端口（默认: 8888）",
     )
     parser.add_argument(
         "--no-reload",

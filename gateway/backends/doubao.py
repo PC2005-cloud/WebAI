@@ -26,15 +26,12 @@ from pydantic import BaseModel, Field
 
 from gateway.backends import register
 from gateway.backends.base import BaseBackend
-from gateway.schemas import Message, MessageList
 
 
 class ChatRequest(BaseModel):
     """对话请求体。"""
 
-    messages: list[Message] = Field(
-        description="OpenAI 格式的消息列表，如 [{\"role\": \"user\", \"content\": \"你好\"}]"
-    )
+    content: str = Field(description="用户输入文本")
     model: str = Field("default", description="模型 ID")
     stream: bool = Field(False, description="是否使用 SSE 流式响应")
 

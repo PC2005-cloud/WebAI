@@ -19,8 +19,6 @@ from typing import AsyncGenerator
 
 from fastapi import APIRouter
 
-from gateway.schemas import MessageList
-
 
 class BaseBackend(ABC):
     """所有后端适配器必须实现的接口。"""

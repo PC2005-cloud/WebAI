@@ -8,16 +8,16 @@ PoW 计算仍需要隐藏浏览器，但每次只需 ∼10s 即可复用。
 调用链路:
     POST /v1/deepseek/chat
       → DeepSeekBackend.chat_endpoint()
-        → _ensure_client()        # 首次调用时在线程中初始化
+        → _ensure_client()
           → _DeepSeekHTTPClient.start()
             → load_token()
-            → PowSolver.start()    # 启动常驻 headless 浏览器
+            → PowSolver.start()
         → _handle_normal / _handle_stream
           → asyncio.to_thread(client.ask/ask_stream)
-            → _create_session()    # POST /api/v0/chat_session/create
-            → PowSolver.solve()    # 触发 PoW 计算
-            → _send_completion()   # POST /api/v0/chat/completion
-            → extract_content_from_sse()  # 解析 SSE 响应
+            → _create_session()
+            → PowSolver.solve()
+            → _send_completion()
+            → extract_content_from_sse()
 
 线程安全
 --------
@@ -29,9 +29,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import AsyncGenerator
 
-from fastapi import APIRouter, Body
+from fastapi import APIRouter
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
@@ -43,7 +44,6 @@ from core.exceptions import (
 from gateway.backends import register
 from gateway.backends.base import BaseBackend
 from gateway.deepseek.client import _DeepSeekHTTPClient
-from gateway.schemas import Message, MessageList
 
 logger = logging.getLogger(__name__)
 
@@ -56,28 +56,24 @@ logger = logging.getLogger(__name__)
 class ChatRequest(BaseModel):
     """对话请求体。"""
 
-    messages: list[Message] = Field(
-        description="""OpenAI 格式的消息列表。
-
-每条消息包含 role 和 content 字段：
-- **role**: "system" | "user" | "assistant" | "tool"
-- **content**: 消息文本
-
-示例：
-```json
-[
-  {"role": "system", "content": "你是一个数学助手"},
-  {"role": "user",   "content": "1+1等于几？"}
-]
-```"""
+    content: str = Field(
+        description="用户输入文本",
     )
     model: str = Field(
         "default",
-        description="模型 ID，当前仅支持 `default`",
+        description="模型: `default`（快速）/ `expert`（专家）/ `vision`（识图）",
+    )
+    thinking_enabled: bool = Field(
+        True,
+        description="是否开启深度思考",
+    )
+    search_enabled: bool = Field(
+        False,
+        description="是否开启智能搜索（仅快速模式有效）",
     )
     stream: bool = Field(
         False,
-        description="是否使用 SSE 流式响应。\n- `false`：一次性返回完整文本\n- `true`：逐块推送内容",
+        description="是否使用 SSE 流式响应",
     )
 
 
@@ -101,8 +97,7 @@ class ChatResponse(BaseModel):
 class DeepSeekBackend(BaseBackend):
     """DeepSeek 后端适配器。
 
-    首次调用 chat 时在线程池中懒初始化 _DeepSeekHTTPClient
-    （含 PoW 浏览器启动，耗时 ∼15s）。
+    首次调用 chat 时懒初始化 _DeepSeekHTTPClient（含 PoW 浏览器）。
     后续调用复用已初始化的客户端。
     """
 
@@ -120,7 +115,7 @@ class DeepSeekBackend(BaseBackend):
 
     @property
     def models(self) -> list[str]:
-        return ["default"]
+        return ["default", "expert", "vision"]
 
     def register_routes(self, router: APIRouter) -> None:
         prefix = f"/v1/{self.name}"
@@ -133,17 +128,13 @@ class DeepSeekBackend(BaseBackend):
             description="""
     向 DeepSeek 发送消息并获取 AI 回复。
 
-    ## 非流式（stream=false 默认）
-    发送完整消息后等待 AI 回复完成，一次性返回结果。
-
     请求体示例：
     ```json
     {
-      "messages": [
-        {"role": "system", "content": "你是一个数学助手"},
-        {"role": "user", "content": "1+1等于几？"}
-      ],
+      "content": "你好",
       "model": "default",
+      "thinking_enabled": true,
+      "search_enabled": false,
       "stream": false
     }
     ```
@@ -151,82 +142,26 @@ class DeepSeekBackend(BaseBackend):
     响应示例：
     ```json
     {
-      "code": 1,
-      "message": "success",
-      "data": {
-        "id": "chat-deepseek",
-        "content": "1+1等于2。",
-        "finish_reason": "stop"
-      }
+      "id": "chat-deepseek",
+      "content": "你好！有什么可以帮你的？",
+      "finish_reason": "stop"
     }
     ```
 
-    ## 流式（stream=true）
-    使用 SSE (Server-Sent Events) 逐块推送内容。
-
-    请求体：
-    ```json
-    {
-      "messages": [{"role": "user", "content": "写一首诗"}],
-      "model": "default",
-      "stream": true
-    }
-    ```
-
-    SSE 推送格式（非标准 OpenAPI SSE）：
-    ```
-    data: {"type": "content", "content": "床前"}
-    data: {"type": "content", "content": "明月"}
-    data: {"type": "done", "finish_reason": "stop"}
-    ```
-
-    ## 错误码
-    | 状态码 | 含义 | 处理方式 |
-    |--------|------|---------|
-    | 200 | 成功 | 正常解析 data 字段 |
-    | 402 | 未登录或 token 过期 | 执行 --mode login 重新登录 |
-    | 502 | DeepSeek 后端返回错误 | 稍后重试 |
-    | 503 | PoW 验证超时 | 稍后重试 |
+    ## 模型说明
+    | model | 说明 | 深度思考 | 智能搜索 |
+    |-------|------|---------|---------|
+    | default | 快速模式 | ✅ | ✅ |
+    | expert | 专家模式 | ✅ | ❌ |
+    | vision | 识图模式 | ✅ | ❌ |
     """,
             tags=["DeepSeek"],
             response_model=ChatResponse,
             responses={
-                200: {"description": "对话成功，返回 AI 回复内容"},
-                402: {
-                    "description": "未登录或登录态已过期",
-                    "content": {
-                        "application/json": {
-                            "example": {
-                                "error": "session_expired",
-                                "message": "未检测到登录状态。请先执行 --mode login",
-                                "hint": "请先执行 'uv run python -m gateway.server --mode login'",
-                            }
-                        }
-                    },
-                },
-                502: {
-                    "description": "DeepSeek 后端服务异常",
-                    "content": {
-                        "application/json": {
-                            "example": {
-                                "error": "backend_unavailable",
-                                "message": "对话请求失败 (HTTP 500): ...",
-                            }
-                        }
-                    },
-                },
-                503: {
-                    "description": "PoW 验证服务暂时不可用",
-                    "content": {
-                        "application/json": {
-                            "example": {
-                                "error": "pow_timeout",
-                                "message": "PoW 计算超时（30s）",
-                                "hint": "请稍后重试",
-                            }
-                        }
-                    },
-                },
+                200: {"description": "对话成功"},
+                402: {"description": "未登录或 token 过期"},
+                502: {"description": "DeepSeek 后端服务异常"},
+                503: {"description": "PoW 验证超时"},
             },
         )
 
@@ -235,7 +170,6 @@ class DeepSeekBackend(BaseBackend):
             self.models_endpoint,
             methods=["GET"],
             summary="列出可用模型",
-            description="返回当前 DeepSeek 后端支持的模型 ID 列表。",
             tags=["DeepSeek"],
         )
 
@@ -244,66 +178,43 @@ class DeepSeekBackend(BaseBackend):
     # --------------------------------------------------
 
     async def chat_endpoint(self, req: ChatRequest):
-        """POST /v1/deepseek/chat — 发送对话。"""
-        # 1. 确保客户端已初始化（首次需启动 PoW 浏览器）
+        """POST /v1/deepseek/chat"""
+        _t0 = time.monotonic()
+        logger.info(
+            "[%s] model=%s content=%s字节 think=%s search=%s stream=%s",
+            "chat", req.model, len(req.content),
+            req.thinking_enabled, req.search_enabled, req.stream,
+        )
+
         try:
             await self._ensure_client()
         except SessionExpiredError as exc:
-            logger.warning("对话请求被拒: 未登录 (%s)", exc)
+            logger.warning("未登录 (%s)", exc)
             from fastapi.responses import JSONResponse
-
-            return JSONResponse(
-                status_code=402,
-                content={
-                    "error": "session_expired",
-                    "message": str(exc),
-                    "hint": "请先执行 'uv run python -m gateway.server --mode login'",
-                },
-            )
-
-        # 2. 处理对话
-        logger.info(
-            "[请求] model=%s stream=%s messages=%d条",
-            req.model, req.stream, len(req.messages),
-        )
-        try:
-            if req.stream:
-                return await self._handle_stream(req)
-            return await self._handle_normal(req)
-        except SessionExpiredError as exc:
-            logger.warning("Token 过期: %s", exc)
-            from fastapi.responses import JSONResponse
-
             return JSONResponse(
                 status_code=402,
                 content={"error": "session_expired", "message": str(exc)},
             )
+
+        try:
+            result = await (self._handle_stream(req) if req.stream else self._handle_normal(req))
+            logger.info("[%s] 完成 %.1fs", "stream" if req.stream else "chat", time.monotonic() - _t0)
+            return result
+        except SessionExpiredError as exc:
+            from fastapi.responses import JSONResponse
+            logger.warning("token过期 %.1fs", time.monotonic() - _t0)
+            return JSONResponse(status_code=402, content={"error": "session_expired", "message": str(exc)})
         except PowTimeoutError as exc:
-            logger.error("PoW 超时: %s", exc)
             from fastapi.responses import JSONResponse
-
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "error": "pow_timeout",
-                    "message": str(exc),
-                    "hint": "DeepSeek 验证服务暂时不可用，请稍后重试",
-                },
-            )
+            logger.error("PoW超时 %.1fs", time.monotonic() - _t0)
+            return JSONResponse(status_code=503, content={"error": "pow_timeout", "message": str(exc)})
         except BackendNotAvailableError as exc:
-            logger.error("后端返回错误: %s", exc)
             from fastapi.responses import JSONResponse
-
-            return JSONResponse(
-                status_code=502,
-                content={
-                    "error": "backend_unavailable",
-                    "message": str(exc),
-                },
-            )
+            logger.error("后端错误 %.1fs", time.monotonic() - _t0)
+            return JSONResponse(status_code=502, content={"error": "backend_unavailable", "message": str(exc)})
 
     async def models_endpoint(self):
-        """GET /v1/deepseek/models — 返回可用模型列表。"""
+        """GET /v1/deepseek/models"""
         return {"models": self.models}
 
     # --------------------------------------------------
@@ -312,32 +223,22 @@ class DeepSeekBackend(BaseBackend):
 
     async def chat(
         self,
-        messages: MessageList,
+        content: str,
         model: str = "default",
         stream: bool = False,
     ) -> str | AsyncGenerator[str, None]:
-        """实现 BaseBackend 接口，供内部或其他模块调用。"""
+        """实现 BaseBackend 接口。"""
         await self._ensure_client()
         if stream:
-            return self._stream_response(messages, model)
-        return await asyncio.to_thread(self._client.ask, messages, model)
+            return self._stream_response(content, model)
+        return await asyncio.to_thread(self._client.ask, content, model)
 
     async def check_health(self) -> bool:
-        """检查 DeepSeek 后端是否可用。
-
-        检查项:
-        - Token 是否存在且有效
-        - PoW 浏览器是否正常运行
-        """
         try:
             if self._client is None:
-                logger.debug("[健康检查] 客户端未初始化")
                 return False
-            healthy = self._client.is_healthy
-            logger.debug("[健康检查] DeepSeek 状态: %s", "正常" if healthy else "异常")
-            return healthy
-        except Exception as exc:
-            logger.warning("[健康检查] 检查失败: %s", exc)
+            return self._client.is_healthy
+        except Exception:
             return False
 
     # --------------------------------------------------
@@ -345,35 +246,23 @@ class DeepSeekBackend(BaseBackend):
     # --------------------------------------------------
 
     async def _ensure_client(self) -> None:
-        """确保 DeepSeek HTTP 客户端已初始化（线程安全，仅首次执行）。
-
-        使用双重检查锁定（Double-Checked Locking）模式:
-        1. 先判断 self._client 是否 None（无锁）
-        2. 拿到 async Lock 后再次判断（避免竞态）
-        """
         if self._client is not None:
             return
-
         async with self._init_lock:
             if self._client is not None:
                 return
-
-            logger.info("[初始化] 首次请求，启动 DeepSeek 客户端 ...")
+            logger.info("[初始化] 启动 DeepSeek 客户端 ...")
             client = _DeepSeekHTTPClient()
             await asyncio.to_thread(client.start)
             self._client = client
-            logger.info("[初始化] DeepSeek 客户端就绪（PoW 浏览器已常驻）")
+            logger.info("[初始化] DeepSeek 客户端就绪")
 
     async def _handle_normal(self, req: ChatRequest) -> dict:
-        """处理非流式请求。
-
-        在线程池中运行同步的 client.ask()，
-        返回统一格式的响应 JSON。
-        """
         content = await asyncio.to_thread(
-            self._client.ask, req.messages, req.model
+            self._client.ask, req.content, req.model,
+            req.thinking_enabled, req.search_enabled,
         )
-        logger.info("[响应] 非流式完成, 长度=%d字符", len(content))
+        logger.info("[响应] 非流式完成, %d字符", len(content))
         return {
             "id": "chat-deepseek",
             "content": content,
@@ -381,15 +270,11 @@ class DeepSeekBackend(BaseBackend):
         }
 
     async def _handle_stream(self, req: ChatRequest) -> EventSourceResponse:
-        """处理流式请求。
-
-        先在线程池中收集所有内容块（同步 httpx 只能这样），
-        再用 SSE EventSourceResponse 逐块发送给客户端。
-        """
         chunks = await asyncio.to_thread(
-            self._client.ask_stream, req.messages, req.model
+            self._client.ask_stream, req.content, req.model,
+            req.thinking_enabled, req.search_enabled,
         )
-        logger.info("[响应] 流式完成, %d个块", len(chunks))
+        logger.info("[响应] 流式完成, %d块", len(chunks))
 
         async def event_generator():
             for chunk in chunks:
@@ -399,13 +284,8 @@ class DeepSeekBackend(BaseBackend):
         return EventSourceResponse(event_generator())
 
     async def _stream_response(
-        self,
-        messages: MessageList,
-        model: str,
+        self, content: str, model: str,
     ) -> AsyncGenerator[str, None]:
-        """异步生成器接口——逐块 yield 内容给上游调用者。"""
-        chunks = await asyncio.to_thread(
-            self._client.ask_stream, messages, model
-        )
+        chunks = await asyncio.to_thread(self._client.ask_stream, content, model)
         for chunk in chunks:
             yield chunk

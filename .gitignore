@@ -6,3 +6,11 @@ browsers/
 *.log
 .idea/
 优化计划
+_*.py
+_*.mjs
+*.wasm
+*.json
+main_bundle.js
+vendors_bundle.js
+timing*.txt
+doc/
