@@ -424,7 +424,7 @@ class _DeepSeekHTTPClient:
 
         chunks: list[str] = []
         last_p = ""
-        for line in resp.iter_lines(decode_unicode=True):
+        for line in resp.iter_lines():
             if not line or not line.startswith("data: "):
                 continue
             s = line[6:].strip()

@@ -22,7 +22,15 @@ import sys
 
 import uvicorn
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 
+from core.exceptions import (
+    BackendNotAvailableError,
+    BackendNotFoundError,
+    PowTimeoutError,
+    SessionExpiredError,
+    WebAiError,
+)
 from core.response import Result
 from gateway.backends import list_backends, register_all_routes
 
@@ -60,6 +68,37 @@ app = FastAPI(
     version="0.1.0",
     docs_url="/docs",
 )
+
+
+# ============================================================
+# 全局异常处理器
+# ============================================================
+
+
+@app.exception_handler(WebAiError)
+async def webai_error_handler(request, exc: WebAiError):
+    """捕获 WebAiError 异常，返回 Result 格式。"""
+    status_map = {
+        SessionExpiredError: 402,
+        PowTimeoutError: 503,
+        BackendNotAvailableError: 502,
+        BackendNotFoundError: 404,
+    }
+    status = 500
+    for exc_type, code in status_map.items():
+        if isinstance(exc, exc_type):
+            status = code
+            break
+    logger.warning("[%d] %s: %s", status, type(exc).__name__, exc)
+    return JSONResponse(status_code=status, content=Result.error(str(exc)).model_dump())
+
+
+@app.exception_handler(ValueError)
+async def value_error_handler(request, exc: ValueError):
+    """捕获参数校验错误，返回 400。"""
+    logger.warning("[400] ValueError: %s", exc)
+    return JSONResponse(status_code=400, content=Result.error(str(exc)).model_dump())
+
 
 # ============================================================
 # 全局端点

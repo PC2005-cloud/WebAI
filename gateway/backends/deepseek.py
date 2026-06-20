@@ -28,19 +28,16 @@ Playwright 和 httpx 都是同步库，不能在 FastAPI async 事件循环中�
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from typing import AsyncGenerator
 
 from fastapi import APIRouter
 from pydantic import BaseModel, Field
-from sse_starlette.sse import EventSourceResponse
+from fastapi.responses import StreamingResponse
 
-from core.exceptions import (
-    BackendNotAvailableError,
-    PowTimeoutError,
-    SessionExpiredError,
-)
+from core.response import Result
 from gateway.backends import register
 from gateway.backends.base import BaseBackend
 from gateway.deepseek.client import _DeepSeekHTTPClient
@@ -74,17 +71,6 @@ class ChatRequest(BaseModel):
     stream: bool = Field(
         False,
         description="是否使用 SSE 流式响应",
-    )
-
-
-class ChatResponse(BaseModel):
-    """非流式对话响应体。"""
-
-    id: str = Field(description="对话标识，固定为 `chat-deepseek`")
-    content: str = Field(description="AI 回复文本")
-    finish_reason: str = Field(
-        "stop",
-        description="结束原因，`stop` 表示正常完成",
     )
 
 
@@ -156,7 +142,7 @@ class DeepSeekBackend(BaseBackend):
     | vision | 识图模式 | ✅ | ❌ |
     """,
             tags=["DeepSeek"],
-            response_model=ChatResponse,
+            response_model=Result,
             responses={
                 200: {"description": "对话成功"},
                 402: {"description": "未登录或 token 过期"},
@@ -171,6 +157,7 @@ class DeepSeekBackend(BaseBackend):
             methods=["GET"],
             summary="列出可用模型",
             tags=["DeepSeek"],
+            response_model=Result,
         )
 
     # --------------------------------------------------
@@ -186,36 +173,24 @@ class DeepSeekBackend(BaseBackend):
             req.thinking_enabled, req.search_enabled, req.stream,
         )
 
-        try:
-            await self._ensure_client()
-        except SessionExpiredError as exc:
-            logger.warning("未登录 (%s)", exc)
-            from fastapi.responses import JSONResponse
-            return JSONResponse(
-                status_code=402,
-                content={"error": "session_expired", "message": str(exc)},
-            )
+        # 校验模型名
+        allowed_models = ("default", "expert", "vision")
+        if req.model not in allowed_models:
+            raise ValueError(f"不支持的模型 '{req.model}'，可选: {', '.join(allowed_models)}")
 
-        try:
-            result = await (self._handle_stream(req) if req.stream else self._handle_normal(req))
-            logger.info("[%s] 完成 %.1fs", "stream" if req.stream else "chat", time.monotonic() - _t0)
-            return result
-        except SessionExpiredError as exc:
-            from fastapi.responses import JSONResponse
-            logger.warning("token过期 %.1fs", time.monotonic() - _t0)
-            return JSONResponse(status_code=402, content={"error": "session_expired", "message": str(exc)})
-        except PowTimeoutError as exc:
-            from fastapi.responses import JSONResponse
-            logger.error("PoW超时 %.1fs", time.monotonic() - _t0)
-            return JSONResponse(status_code=503, content={"error": "pow_timeout", "message": str(exc)})
-        except BackendNotAvailableError as exc:
-            from fastapi.responses import JSONResponse
-            logger.error("后端错误 %.1fs", time.monotonic() - _t0)
-            return JSONResponse(status_code=502, content={"error": "backend_unavailable", "message": str(exc)})
+        # 校验参数组合
+        if req.model != "default" and req.search_enabled:
+            raise ValueError(f"'{req.model}' 模式不支持智能搜索")
+
+        await self._ensure_client()
+        result = await (self._handle_stream(req) if req.stream else self._handle_normal(req))
+        logger.info("[%s] 完成 %.1fs", "stream" if req.stream else "chat", time.monotonic() - _t0)
+        return result
 
     async def models_endpoint(self):
         """GET /v1/deepseek/models"""
-        return {"models": self.models}
+        from core.response import Result
+        return Result.success(self.models)
 
     # --------------------------------------------------
     # BaseBackend 接口实现
@@ -258,18 +233,16 @@ class DeepSeekBackend(BaseBackend):
             logger.info("[初始化] DeepSeek 客户端就绪")
 
     async def _handle_normal(self, req: ChatRequest) -> dict:
+        from core.response import Result
+
         content = await asyncio.to_thread(
             self._client.ask, req.content, req.model,
             req.thinking_enabled, req.search_enabled,
         )
         logger.info("[响应] 非流式完成, %d字符", len(content))
-        return {
-            "id": "chat-deepseek",
-            "content": content,
-            "finish_reason": "stop",
-        }
+        return Result.success(content)
 
-    async def _handle_stream(self, req: ChatRequest) -> EventSourceResponse:
+    async def _handle_stream(self, req: ChatRequest) -> StreamingResponse:
         chunks = await asyncio.to_thread(
             self._client.ask_stream, req.content, req.model,
             req.thinking_enabled, req.search_enabled,
@@ -278,10 +251,29 @@ class DeepSeekBackend(BaseBackend):
 
         async def event_generator():
             for chunk in chunks:
-                yield {"type": "content", "content": chunk}
-            yield {"type": "done", "finish_reason": "stop"}
+                data = {
+                    "id": "chatcmpl-deepseek",
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": req.model,
+                    "choices": [{"index": 0, "delta": {"content": chunk}, "finish_reason": None}],
+                }
+                yield f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+            # 结束标记
+            data = {
+                "id": "chatcmpl-deepseek",
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": req.model,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            }
+            yield f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+            yield "data: [DONE]\n\n"
 
-        return EventSourceResponse(event_generator())
+        return StreamingResponse(
+            event_generator(),
+            media_type="text/event-stream",
+        )
 
     async def _stream_response(
         self, content: str, model: str,
