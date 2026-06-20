@@ -73,15 +73,26 @@ class ChatRequest(BaseModel):
         False,
         description="是否开启智能搜索（仅快速模式有效）",
     )
+    auto_clean: bool = Field(
+        True,
+        description="对话完成后是否自动删除该会话（不清除聊天记录）",
+    )
     stream: bool = Field(
         False,
         description="是否使用 SSE 流式响应",
     )
 
 
+class DeleteRequest(BaseModel):
+    """删除对话请求体。"""
+
+    session_id: str = Field(description="要删除的对话 session ID")
+
+
 class ChatResponse(BaseModel):
     """对话响应体。"""
 
+    id: str = Field(description="对话 session ID，可用于删除接口")
     content: str = Field(description="AI 回复文本")
     thinking: str | None = Field(
         None,
@@ -175,6 +186,16 @@ class DeepSeekBackend(BaseBackend):
             response_model=Result,
         )
 
+        router.add_api_route(
+            f"{prefix}/session/delete",
+            self.delete_session_endpoint,
+            methods=["POST"],
+            summary="删除对话记录",
+            description="通过 session ID 删除对话记录，清理聊天列表。",
+            tags=["DeepSeek"],
+            response_model=Result,
+        )
+
     # --------------------------------------------------
     # 端点实现
     # --------------------------------------------------
@@ -206,6 +227,28 @@ class DeepSeekBackend(BaseBackend):
         """GET /v1/deepseek/models"""
         from core.response import Result
         return Result.success(self.models)
+
+    async def delete_session_endpoint(self, req: DeleteRequest):
+        """POST /v1/deepseek/session/delete"""
+        from core.response import Result
+        try:
+            if self._client is not None:
+                self._client.delete_session(req.session_id)
+            else:
+                # 直接调用 API 删除
+                import httpx
+                from gateway.deepseek.session import load_token
+                token = load_token()
+                if token:
+                    httpx.post(
+                        "https://chat.deepseek.com/api/v0/chat_session/delete",
+                        json={"chat_session_id": req.session_id},
+                        headers={"Authorization": f"Bearer {token}"},
+                        timeout=10,
+                    )
+            return Result.success(None)
+        except Exception as exc:
+            return Result.error(str(exc))
 
     # --------------------------------------------------
     # BaseBackend 接口实现
@@ -255,13 +298,13 @@ class DeepSeekBackend(BaseBackend):
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(
             _pow_executor, self._client.ask, req.content, req.model,
-            req.thinking_enabled, req.search_enabled,
+            req.thinking_enabled, req.search_enabled, req.auto_clean,
         )
-        content, thinking = result if isinstance(result, tuple) else (result, "")
+        content, thinking, session_id = result if isinstance(result, tuple) and len(result) == 3 else (result, "", "")
         logger.info("[响应] 非流式完成, %d字符 思考%d字符", len(content), len(thinking))
 
         return Result.success(
-            ChatResponse(content=content, thinking=thinking or None)
+            ChatResponse(id=session_id, content=content, thinking=thinking or None)
         )
 
     async def _handle_stream(self, req: ChatRequest) -> StreamingResponse:
@@ -283,6 +326,7 @@ class DeepSeekBackend(BaseBackend):
             args=(
                 session_id, req.content, model_type, pow_header,
                 sync_queue, req.thinking_enabled, req.search_enabled,
+                req.auto_clean,
             ),
             daemon=True,
         )
@@ -323,6 +367,7 @@ class DeepSeekBackend(BaseBackend):
         return StreamingResponse(
             event_generator(),
             media_type="text/event-stream",
+            headers={"x-session-id": session_id},
         )
 
     async def _stream_response(

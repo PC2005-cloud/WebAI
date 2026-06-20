@@ -208,14 +208,16 @@ class _DeepSeekHTTPClient:
         model: str = "default",
         thinking_enabled: bool = True,
         search_enabled: bool = False,
-    ) -> str:
-        """发送对话消息，返回完整响应文本。
+        auto_clean: bool = True,
+    ) -> tuple:
+        """发送对话消息，返回 (content, thinking, session_id)。
 
         Args:
             content: 用户输入文本
             model: 模型名（default / expert / vision）
             thinking_enabled: 是否开启深度思考
             search_enabled: 是否开启智能搜索
+            auto_clean: 完成后是否自动删除 session
         """
         if not self._started:
             raise RuntimeError("客户端未启动，请先调用 start()")
@@ -241,7 +243,9 @@ class _DeepSeekHTTPClient:
             "[对话] 完成 (%.1fs | 会话%.1fs PoW%.1fs HTTP%.1fs | %d字符 思考%d字符)",
             t3 - t0, t1 - t0, t2 - t1, t3 - t2, len(text_content), len(thinking),
         )
-        return (text_content, thinking)
+        if auto_clean:
+            self.delete_session(sid)
+        return (text_content, thinking, sid)
 
     def ask_stream(
         self,
@@ -276,6 +280,7 @@ class _DeepSeekHTTPClient:
         )
 
         logger.info("[流式] 完成 (%.1fs, %d 块)", time.monotonic() - t0, len(chunks))
+        self.delete_session(sid)
         return chunks
 
     # --------------------------------------------------
@@ -325,6 +330,27 @@ class _DeepSeekHTTPClient:
             raise BackendNotAvailableError(
                 f"创建会话失败: {exc}。响应: {text}"
             ) from exc
+
+    def delete_session(self, session_id: str) -> None:
+        """删除指定 session，避免聊天记录堆积。
+
+        POST /api/v0/chat_session/delete
+        body: {"chat_session_id": "uuid"}
+        """
+        try:
+            url = urljoin(BASE_URL, "/api/v0/chat_session/delete")
+            resp = httpx.post(
+                url,
+                json={"chat_session_id": session_id},
+                headers={"Authorization": f"Bearer {self._token}"},
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                logger.debug("[API] session 已删除: %s", session_id[:8])
+            else:
+                logger.warning("[API] 删除 session 失败 %d: %s", resp.status_code, session_id[:8])
+        except Exception as exc:
+            logger.warning("[API] 删除 session 异常: %s", exc)
 
     def _send_completion(
         self,
@@ -500,6 +526,7 @@ class _DeepSeekHTTPClient:
         output_queue: queue.Queue,
         thinking_enabled: bool = True,
         search_enabled: bool = False,
+        auto_clean: bool = True,
     ) -> None:
         """在线程中完成完整流式请求：创建 session → PoW → HTTP 流式读取。
 
@@ -569,6 +596,9 @@ class _DeepSeekHTTPClient:
                             frags = resp_obj.get("fragments", [])
                             if frags:
                                 current_type = frags[-1].get("type", current_type)
+
+            if auto_clean:
+                self.delete_session(session_id)
         except Exception as exc:
             logger.error("[流式] 线程错误: %s", exc)
             output_queue.put(("[error]", False))
